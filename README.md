@@ -244,6 +244,6 @@ dsdba/
 
 ## Credits
 
-**Team:** Ferel & Safa — ITS Informatics, KCVanguard ML Workshop  
+**Team:** Ferel, Razan, and Safa — ITS Informatics, KCVanguard ML Workshop  
 **Standard:** IEEE Std 830-1998 (Software Requirements Specification)  
 **Document:** DSDBA-SRS-2026-002 v2.1
