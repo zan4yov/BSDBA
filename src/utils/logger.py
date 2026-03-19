@@ -1,11 +1,11 @@
 """
 Module: logger
 SRS Reference: NFR-Security (no print() in any module), NFR-Maintainability
-SDLC Phase: Phase 3 — Environment Setup & MCP Configuration
+SDLC Phase: Phase 4 — Sprint A (enhanced with helper functions per chain-05)
 Sprint: N/A (utility — shared across all sprints)
 Pipeline Stage: All stages (utility)
 Interface Contract:
-  Input:  N/A — exposes get_logger() factory function
+  Input:  N/A — exposes get_logger() factory + log_info/log_warning/log_error helpers
   Output: logging.Logger — configured structured JSON logger
 Latency Target: N/A (logging overhead negligible)
 Open Questions Resolved: N/A
@@ -17,7 +17,7 @@ Author: Ferel / Safa
 Date: 2026-03-19
 """
 
-# [DRAFT — Phase 3 — Sprint N/A — Pending V.E.R.I.F.Y.]
+# [DRAFT — Phase 4 — Sprint A — Pending V.E.R.I.F.Y.]
 
 from __future__ import annotations
 
@@ -35,10 +35,14 @@ class _StructuredJSONFormatter(logging.Formatter):
     Each record is serialised to: {"timestamp": ..., "level": ...,
     "logger": ..., "message": ..., [optional extra fields]}.
 
+    Captured extra fields: stage, srs_ref, latency_ms, error_code, data.
+
     Security rule: API key values must NEVER appear in any log field.
     The formatter does not redact automatically — callers are responsible.
     [FR-NLP-005, NFR-Security]
     """
+
+    _EXTRA_KEYS: tuple[str, ...] = ("stage", "srs_ref", "latency_ms", "error_code", "data")
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -53,9 +57,11 @@ class _StructuredJSONFormatter(logging.Formatter):
         if record.exc_info:
             payload["exception"] = traceback.format_exception(*record.exc_info)
 
-        for key in ("stage", "srs_ref", "latency_ms", "error_code"):
+        for key in self._EXTRA_KEYS:
             if hasattr(record, key):
-                payload[key] = getattr(record, key)
+                value = getattr(record, key)
+                if value is not None:
+                    payload[key] = value
 
         return json.dumps(payload, ensure_ascii=False)
 
@@ -91,3 +97,76 @@ def get_logger(name: str) -> logging.Logger:
     logger.propagate = False
 
     return logger
+
+
+# ── Module-level pipeline logger (shared helper functions) ────────────────────
+
+_pipeline_logger: logging.Logger = get_logger("dsdba.pipeline")
+
+
+def log_info(
+    stage: str,
+    message: str,
+    data: dict[str, Any] | None = None,
+    srs_ref: str = "",
+) -> None:
+    """Emit a structured INFO record from a pipeline stage.
+
+    Produces JSON: {timestamp, level, stage, message, [data], [srs_ref]}.
+
+    Security: never pass API key values in ``data``. [FR-NLP-005]
+
+    Args:
+        stage (str): Pipeline stage name (e.g. "Audio DSP", "CV Inference").
+        message (str): Human-readable log message. No sensitive data.
+        data (dict | None): Optional structured payload for machine parsing.
+                            Must be JSON-serialisable. Default None.
+        srs_ref (str): Optional SRS FR ID reference (e.g. "FR-AUD-010").
+    """
+    _pipeline_logger.info(
+        message,
+        extra={"stage": stage, "srs_ref": srs_ref or None, "data": data},
+    )
+
+
+def log_warning(
+    stage: str,
+    message: str,
+    data: dict[str, Any] | None = None,
+    srs_ref: str = "",
+) -> None:
+    """Emit a structured WARNING record from a pipeline stage.
+
+    Args:
+        stage (str): Pipeline stage name.
+        message (str): Warning message. No sensitive data.
+        data (dict | None): Optional structured payload.
+        srs_ref (str): Optional SRS FR ID reference.
+    """
+    _pipeline_logger.warning(
+        message,
+        extra={"stage": stage, "srs_ref": srs_ref or None, "data": data},
+    )
+
+
+def log_error(
+    stage: str,
+    message: str,
+    error_code: str = "",
+    data: dict[str, Any] | None = None,
+) -> None:
+    """Emit a structured ERROR record from a pipeline stage.
+
+    Security: error messages MUST be generic — no file paths, internal state,
+    or API credentials. [NFR-Security]
+
+    Args:
+        stage (str): Pipeline stage name.
+        message (str): Generic error message safe for structured logging.
+        error_code (str): SRS error code (e.g. "AUD-001"). Default "".
+        data (dict | None): Optional structured diagnostic payload.
+    """
+    _pipeline_logger.error(
+        message,
+        extra={"stage": stage, "error_code": error_code or None, "data": data},
+    )

@@ -9,11 +9,11 @@
 
 | Field | Value |
 |-------|-------|
-| **Active SDLC Phase** | Phase 3 — Environment Setup & MCP Configuration COMPLETE |
-| **Active Sprint** | Sprint A (entry criteria satisfied — all Qs resolved) |
-| **Last Completed** | Phase 3 — Environment Setup & MCP Configuration (Chain 04) |
-| **Next Action** | Run Chain 05: Sprint A — `src/audio/dsp.py` implementation |
-| **Gate Status** | Phase 3 COMPLETE — Q3 RESOLVED — all stubs created — Sprint A ready |
+| **Active SDLC Phase** | Phase 4 — Sprint A COMPLETE |
+| **Active Sprint** | Sprint B (entry criteria: empirical Q3 VRAM test in Colab Cell 3) |
+| **Last Completed** | Sprint A — `src/audio/dsp.py` full implementation (Chain 05) |
+| **Next Action** | Run Chain 06: Sprint B — `src/cv/model.py`, `src/cv/train.py`, `src/cv/infer.py` |
+| **Gate Status** | Sprint A COMPLETE — 12/12 tests pass — FR-AUD-001–011 all implemented |
 
 ---
 
@@ -39,6 +39,9 @@
 | Phase 3 | README.md GitHub Setup | All FRs (project overview, pipeline diagram, installation, architecture) | `README.md` |
 | Phase 3 | Source File Stubs (10 modules) | All FRs — module docstrings + locked interface signatures | `src/**/*.py`, `app.py` |
 | Phase 3 | `src/utils/errors.py` Full Implementation | FR-AUD-001, FR-AUD-005, FR-CV-004, FR-CV-010 | `src/utils/errors.py` |
+| Phase 4 | Sprint A: `src/audio/dsp.py` Full Implementation | FR-AUD-001–011 (all) | `src/audio/dsp.py` |
+| Phase 4 | Sprint A: `src/tests/test_audio.py` — 12 tests, all passing | FR-AUD-001–011, NFR-Performance | `src/tests/test_audio.py` |
+| Phase 4 | Sprint A: `src/utils/logger.py` Enhanced | NFR-Security, NFR-Maintainability — added `log_info/log_warning/log_error` + `data` field capture | `src/utils/logger.py` |
 
 ---
 
@@ -106,6 +109,11 @@
 | `src/utils/logger.py` | Session 04 | 3 | Structured JSON logger — `get_logger()` factory |
 | `src/utils/errors.py` | Session 04 | 3 | FULL IMPL — `ErrorCode` enum + `DSDBAError` dataclass |
 | `app.py` | Session 04 | 3 | Sprint E stub — `build_demo()` signature (Gradio 4.x wiring) |
+| `src/__init__.py` | Session 05 | 4 | Package init — enables `src.*` imports |
+| `src/audio/__init__.py` | Session 05 | 4 | Package init — Audio DSP sub-package |
+| `src/utils/__init__.py` | Session 05 | 4 | Package init — Utilities sub-package |
+| `src/tests/__init__.py` | Session 05 | 4 | Package init — Test suite sub-package |
+| `src/tests/test_audio.py` | Session 05 | 4 | Sprint A test suite — 12 tests (7 SRS edge-cases + 5 unit tests), all passing |
 
 ---
 
@@ -197,3 +205,19 @@
 **Tech Debt Logged:**
 - Notebook Cell 4 + Cell 5 use placeholder HF dataset repo ID — fill before Sprint B (FR-CV-007)
 **Next:** Run Chain 05 — Sprint A: `src/audio/dsp.py` implementation (FR-AUD-001–011)
+
+### Session 05 — Phase 4: Sprint A — Audio DSP Module (Chain 05)
+**Date:** 2026-03-19
+**Status:** COMPLETE
+**Actions:**
+- Created `src/__init__.py`, `src/audio/__init__.py`, `src/utils/__init__.py`, `src/tests/__init__.py` — Python package structure.
+- Enhanced `src/utils/logger.py`: added `data` field capture to `_StructuredJSONFormatter`, added `log_info()`, `log_warning()`, `log_error()` helper functions per chain-05 spec.
+- Fully implemented `src/audio/dsp.py` (FR-AUD-001–011): 10 functions — `load_audio()`, `validate_duration()`, `resample_audio()`, `to_mono()`, `fix_duration()`, `extract_mel_spectrogram()`, `normalise_spectrogram()`, `to_tensor()`, `preprocess_audio()` (public API), `preprocess_batch()` (FR-AUD-009 SHOULD).
+- Verified librosa 0.10.x API via context7-mcp before implementation.
+- Created `src/tests/test_audio.py`: 12 pytest tests (7 SRS edge-cases from chain-05 spec + 5 unit tests for helpers).
+- Ran `pytest src/tests/test_audio.py -v`: **12/12 PASSED**.
+**FRs Addressed:** FR-AUD-001, FR-AUD-002, FR-AUD-003, FR-AUD-004, FR-AUD-005, FR-AUD-006, FR-AUD-007, FR-AUD-008, FR-AUD-009, FR-AUD-010, FR-AUD-011 — all Sprint A FRs COMPLETE.
+**Tech Debt Logged:**
+- [TECH DEBT: Local env uses torch 2.10.0+cpu (Python 3.13) vs pinned torch==2.1.0 in requirements.txt (Python 3.10, Colab). Tests pass on 2.10; Colab compatibility assumed | SRS-ref: FR-CV-001]
+- [TECH DEBT: resampy==0.4.2 compatibility with librosa 0.11.0 unverified — local install used librosa 0.11.0 (latest), Colab will use 0.10.1 per requirements.txt. Verify at Sprint B Colab setup | SRS-ref: FR-AUD-002]
+**Next:** Run Chain 06 — Sprint B: `src/cv/model.py`, `src/cv/train.py`, `src/cv/infer.py` implementation (FR-CV-001–009, FR-DEP-010). Entry criteria: empirical Q3 VRAM test in Colab notebook Cell 3.
