@@ -66,7 +66,6 @@ class ModelConfig(BaseModel):
     output_activation: str = Field("sigmoid", description="Output activation [FR-CV-004]")
     loss_function: str = Field("bce_weighted", description="Loss function [FR-CV-005]")
     checkpoint_max_mb: int = Field(250, description="Max .pth size [NFR-Performance]")
-    hf_model_repo: str = Field("", description="HF model repo ID [FR-CV-007]")
 
 
 class AugmentationConfig(BaseModel):
@@ -91,6 +90,7 @@ class TrainingConfig(BaseModel):
     save_every_epoch: bool = Field(True, description="Checkpoint per epoch [NFR-Reliability]")
     dataset_split: str = Field("for_2sec", description="FoR variant [Q2 RESOLVED]")
     dataset_source: str = Field("kaggle", description="Dataset origin")
+    hf_model_repo: str = Field("", description="HF model repo ID [FR-CV-007]")
     augmentation: AugmentationConfig = Field(default_factory=AugmentationConfig)
 
 

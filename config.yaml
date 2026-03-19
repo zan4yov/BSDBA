@@ -53,7 +53,7 @@ training:
   save_every_epoch: true              # NFR-Reliability: checkpoint every epoch
   dataset_split: for_2sec             # Q2 RESOLVED: FoR 2-second variant
   dataset_source: kaggle              # FoR Dataset by M. Abdel-Dayem
-  hf_model_repo: ""                   # FR-CV-007: fill with your HF model repo ID
+  hf_model_repo: "https://huggingface.co/zanvvr/dsdba-efficientnet-b4"                   # FR-CV-007: fill with your HF model repo ID
 
   # SpecAugment (FR-CV-006 — SHOULD)
   augmentation:
@@ -91,8 +91,8 @@ gradcam:
 
 # ── NLP / Qwen 2.5 Module (FR-NLP-001–009) ───────────────────────────────────
 nlp:
-  primary_provider: qwen_2.5           # FR-NLP-002: primary LLM (Q1 RESOLVED)
-  fallback_provider: gemma_3           # FR-NLP-007: secondary LLM fallback
+  primary_provider: qwen3-plus      # was: qwen_2.5 — updated to current model
+  fallback_provider: qwen-plus      # Qwen-Plus as first fallback
   final_fallback: rule_based           # FR-NLP-003: always-available template
   timeout_sec: 30                      # FR-NLP-002: API call timeout
   explanation_min_sentences: 3         # FR-NLP-001: prompt instruction
