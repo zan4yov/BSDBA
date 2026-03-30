@@ -1,500 +1,345 @@
 """
-Module: train
-SRS Reference: FR-CV-003, FR-CV-004, FR-CV-005, FR-CV-006, FR-CV-007, FR-CV-008
-SDLC Phase: Phase 4 — Sprint B (full implementation)
+Module: src.cv.train
+SRS Reference: FR-CV-003-008
+SDLC Phase: 3 - Environment Setup & MCP Configuration
 Sprint: B
-Pipeline Stage: CV Inference (training only — no inference logic here)
+Pipeline Stage: CV Inference
+Purpose: Train EfficientNet-B4 for binary classification (bonafide vs spoof) and produce checkpoints.
+Dependencies: torch, torchvision.
 Interface Contract:
-  Input:  torch.nn.Module (EfficientNet-B4), DataLoader (train + val), config
-  Output: DSDBAModel — best-checkpoint model after two-phase training
-Latency Target: ≥ 60 samples/s throughput on T4 GPU per NFR-Performance
-Open Questions Resolved: Q3 — batch_size=16 feasible on T4 (ADR-0008)
-Open Questions Blocking: None
-MCP Tools Used: context7-mcp (PyTorch 2.x training APIs),
-                huggingface-mcp (HF Hub checkpoint upload)
+  Input:  torch.utils.data.DataLoader of (tensor [3,224,224] float32, label int)
+  Output: Path to saved checkpoint (.pth/.pt) for Sprint C inference
+Latency Target: <= 3,000 ms per forward proxy stage (training wall time validated in Sprint B)
+Open Questions Resolved: Q4/Q5/Q6 resolved (downstream only)
+Open Questions Blocking: Q3 - VRAM feasibility affects training viability and checkpoint strategy
+MCP Tools Used: context7-mcp | huggingface-mcp | stitch-mcp
 AI Generated: true
 Verified (V.E.R.I.F.Y.): false
 Author: Ferel / Safa
-Date: 2026-03-19
+Date: 2026-03-22
 """
-
-# [DRAFT — Phase 4 — Sprint B — Pending V.E.R.I.F.Y.]
-# Module boundary: training loop + checkpointing ONLY. No inference. [.cursorrules]
 
 from __future__ import annotations
 
-import pathlib
-import time
-from typing import Any
+import math
+from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 import torch
-import torch.nn as nn
+import yaml
+from huggingface_hub import HfApi
 from sklearn.metrics import roc_auc_score, roc_curve
+from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 
 from src.audio.dsp import preprocess_audio
-from src.cv.model import DSDBAModel, build_model
-from src.utils.config import DSDBAConfig, load_config
-from src.utils.logger import get_logger, log_info, log_warning
-
-# ── Module-level singletons ───────────────────────────────────────────────────
-
-_CONFIG_PATH: pathlib.Path = (
-    pathlib.Path(__file__).parent.parent.parent / "config.yaml"
-)
-_CFG: DSDBAConfig = load_config(_CONFIG_PATH)
-_log = get_logger(__name__)
+from src.cv.model import DSDBAModel
+from src.utils.logger import log_info, log_warning
 
 
-# ── Dataset ───────────────────────────────────────────────────────────────────
+class AudioClassificationDataset(Dataset[tuple[Tensor, int]]):
+  """Dataset that applies DSP preprocessing on each audio file path."""
+
+  def __init__(
+    self,
+    file_paths: list[Path],
+    labels: list[int],
+    cfg: dict[str, Any],
+    transform: Callable[[Tensor], Tensor] | None = None,
+  ) -> None:
+    self.file_paths = file_paths
+    self.labels = labels
+    self.cfg = cfg
+    self.transform = transform
+
+  def __len__(self) -> int:
+    return len(self.file_paths)
+
+  def __getitem__(self, idx: int) -> tuple[Tensor, int]:
+    tensor = preprocess_audio(self.file_paths[idx], self.cfg)
+    if self.transform is not None:
+      tensor = self.transform(tensor)
+    return tensor, int(self.labels[idx])
 
 
-class FoRDataset(Dataset):
-    """Fake-or-Real dataset wrapping preprocessed audio tensors.
-
-    Each sample is loaded via src/audio/dsp.preprocess_audio() and cached
-    in memory after first access.  Labels: bonafide=0, spoof=1 [FR-CV-002].
-
-    Args:
-        file_paths (list[pathlib.Path]): Audio file paths.
-        labels (list[int]): 0 (bonafide) or 1 (spoof) per file.
-        transform (callable | None): Optional augmentation applied to tensor.
-    """
-
-    def __init__(
-        self,
-        file_paths: list[pathlib.Path],
-        labels: list[int],
-        transform: Any | None = None,
-    ) -> None:
-        if len(file_paths) != len(labels):
-            raise ValueError("file_paths and labels must have same length")
-        self.file_paths = file_paths
-        self.labels = labels
-        self.transform = transform
-        self._cache: dict[int, torch.Tensor] = {}
-
-    def __len__(self) -> int:
-        return len(self.file_paths)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
-        if idx not in self._cache:
-            self._cache[idx] = preprocess_audio(self.file_paths[idx])
-        tensor = self._cache[idx].clone()
-        if self.transform is not None:
-            tensor = self.transform(tensor)
-        return tensor, self.labels[idx]
+def _resolve_dataset_paths(root: Path) -> tuple[list[Path], list[int]]:
+  """Resolve audio file paths and labels from bonafide/spoof folders."""
+  exts = {".wav", ".flac", ".mp3", ".ogg"}
+  pairs = [("bonafide", 0), ("spoof", 1)]
+  file_paths: list[Path] = []
+  labels: list[int] = []
+  for class_name, label in pairs:
+    class_dir = root / class_name
+    files = [p for p in sorted(class_dir.rglob("*")) if p.is_file() and p.suffix.lower() in exts]
+    file_paths.extend(files)
+    labels.extend([label] * len(files))
+  return file_paths, labels
 
 
-class TensorDatasetCV(Dataset):
-    """Lightweight dataset from pre-computed tensor list + labels.
+def get_class_weights(dataset: Any) -> Tensor:
+  """[FR-CV-005] Compute inverse-frequency class weights tensor."""
+  labels = getattr(dataset, "labels", None)
+  if labels is None:
+    raise ValueError("Dataset must expose 'labels' for class weight computation")
 
-    Used when tensors are already preprocessed (e.g. loaded from .pt files).
-    """
+  labels_arr = np.asarray(labels, dtype=np.int64)
+  if labels_arr.size == 0:
+    raise ValueError("Dataset labels are empty")
 
-    def __init__(
-        self,
-        tensors: list[torch.Tensor],
-        labels: list[int],
-        transform: Any | None = None,
-    ) -> None:
-        self.tensors = tensors
-        self.labels = labels
-        self.transform = transform
-
-    def __len__(self) -> int:
-        return len(self.tensors)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
-        tensor = self.tensors[idx].clone()
-        if self.transform is not None:
-            tensor = self.transform(tensor)
-        return tensor, self.labels[idx]
+  counts = np.bincount(labels_arr, minlength=2).astype(np.float32)
+  counts[counts == 0.0] = 1.0
+  total = float(np.sum(counts))
+  weights = total / (2.0 * counts)
+  return torch.tensor(weights, dtype=torch.float32)
 
 
-# ── SpecAugment Transform ────────────────────────────────────────────────────
+def build_augmentations(cfg: dict[str, Any]) -> Callable[[Tensor], Tensor]:
+  """[FR-CV-006] Build lightweight spectrogram-domain augmentation callable."""
+  aug_cfg = cfg["training"]["augmentation"]
+  enabled = bool(aug_cfg.get("specaugment_enabled", False))
+  time_mask_pct = float(aug_cfg.get("time_mask_pct", 0.0))
+  freq_mask_pct = float(aug_cfg.get("freq_mask_pct", 0.0))
+  time_shift_sec = float(aug_cfg.get("time_shift_sec", 0.0))
+  snr_db = float(aug_cfg.get("gaussian_noise_snr_db", 20.0))
+  sample_rate = int(cfg["audio"]["sample_rate"])
+  n_samples = int(cfg["audio"]["n_samples"])
+
+  def _augment(x: Tensor) -> Tensor:
+    if not enabled:
+      return x
+
+    out = x.clone()
+    _, h, w = out.shape
+
+    # Frequency masking.
+    max_f = max(1, int(h * freq_mask_pct))
+    f = int(torch.randint(0, max_f + 1, (1,)).item())
+    if f > 0:
+      f0 = int(torch.randint(0, max(1, h - f + 1), (1,)).item())
+      out[:, f0 : f0 + f, :] = 0.0
+
+    # Time masking.
+    max_t = max(1, int(w * time_mask_pct))
+    t = int(torch.randint(0, max_t + 1, (1,)).item())
+    if t > 0:
+      t0 = int(torch.randint(0, max(1, w - t + 1), (1,)).item())
+      out[:, :, t0 : t0 + t] = 0.0
+
+    # Approximate time shift using width roll.
+    max_shift_samples = int(time_shift_sec * sample_rate)
+    max_shift_frames = int((max_shift_samples / max(n_samples, 1)) * w)
+    if max_shift_frames > 0:
+      shift = int(torch.randint(-max_shift_frames, max_shift_frames + 1, (1,)).item())
+      out = torch.roll(out, shifts=shift, dims=-1)
+
+    # Additive Gaussian noise based on SNR target.
+    signal_power = torch.mean(out**2)
+    noise_power = signal_power / max(1e-6, 10 ** (snr_db / 10.0))
+    noise = torch.randn_like(out) * torch.sqrt(noise_power)
+    out = torch.clamp(out + noise, 0.0, 1.0)
+    return out
+
+  return _augment
 
 
-class SpecAugment(nn.Module):
-    """SpecAugment data augmentation applied on [C, H, W] spectrogram tensors.
+def compute_eer(y_true: list[int] | np.ndarray, y_scores: list[float] | np.ndarray) -> float:
+  """[FR-CV-008] Compute Equal Error Rate from labels and spoof scores."""
+  y_true_np = np.asarray(y_true)
+  y_scores_np = np.asarray(y_scores)
+  if len(np.unique(y_true_np)) < 2:
+    return 1.0
 
-    Implements time masking, frequency masking, random time shift, and
-    additive Gaussian noise. All parameters from config.yaml:training.augmentation.
-    SRS: FR-CV-006 (SHOULD).
-
-    Args:
-        time_mask_pct (float): Max fraction of width to mask.
-        freq_mask_pct (float): Max fraction of height to mask.
-        time_shift_pixels (int): Max circular shift in pixels along width.
-        noise_std (float): Gaussian noise standard deviation.
-    """
-
-    def __init__(
-        self,
-        time_mask_pct: float,
-        freq_mask_pct: float,
-        time_shift_pixels: int,
-        noise_std: float,
-    ) -> None:
-        super().__init__()
-        self.time_mask_pct = time_mask_pct
-        self.freq_mask_pct = freq_mask_pct
-        self.time_shift_pixels = time_shift_pixels
-        self.noise_std = noise_std
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply augmentations to a [C, H, W] tensor (training only)."""
-        _, h, w = x.shape
-
-        # Time masking: zero-out a random contiguous block of columns
-        t_width = int(torch.randint(0, max(1, int(w * self.time_mask_pct)), (1,)).item())
-        if t_width > 0:
-            t_start = torch.randint(0, w - t_width + 1, (1,)).item()
-            x[:, :, t_start : t_start + t_width] = 0.0
-
-        # Frequency masking: zero-out a random contiguous block of rows
-        f_height = int(torch.randint(0, max(1, int(h * self.freq_mask_pct)), (1,)).item())
-        if f_height > 0:
-            f_start = torch.randint(0, h - f_height + 1, (1,)).item()
-            x[:, f_start : f_start + f_height, :] = 0.0
-
-        # Time shift: circular roll along width
-        if self.time_shift_pixels > 0:
-            shift = torch.randint(
-                -self.time_shift_pixels, self.time_shift_pixels + 1, (1,)
-            ).item()
-            x = torch.roll(x, shifts=int(shift), dims=2)
-
-        # Gaussian noise [FR-CV-006: SNR ≥ 20 dB]
-        if self.noise_std > 0:
-            x = x + torch.randn_like(x) * self.noise_std
-
-        return x
-
-
-# ── Public Functions ──────────────────────────────────────────────────────────
-
-
-def get_class_weights(labels: list[int], num_classes: int = 2) -> torch.Tensor:
-    """Compute inverse-frequency class weights for balanced loss.
-
-    Args:
-        labels (list[int]): All training labels (0 or 1).
-        num_classes (int): Number of classes. Default 2.
-
-    Returns:
-        torch.Tensor: Class weights of shape [num_classes], float32.
-                      Higher weight for the minority class. SRS: FR-CV-005.
-    """
-    counts = torch.bincount(torch.tensor(labels, dtype=torch.long), minlength=num_classes)
-    counts = counts.float().clamp(min=1.0)
-    weights = counts.sum() / (num_classes * counts)
-    return weights
-
-
-def build_augmentations(cfg: DSDBAConfig) -> SpecAugment | None:
-    """Build SpecAugment transform from config.yaml:training.augmentation.
-
-    Args:
-        cfg (DSDBAConfig): Full configuration.
-
-    Returns:
-        SpecAugment | None: Transform if augmentation is enabled, else None.
-        SRS: FR-CV-006 (SHOULD).
-    """
-    aug_cfg = cfg.training.augmentation
-    if not aug_cfg.specaugment_enabled:
-        return None
-
-    img_w: int = cfg.audio.output_tensor_shape[2]
-    duration: float = cfg.audio.duration_sec
-    shift_pixels = int(aug_cfg.time_shift_sec / duration * img_w)
-
-    snr_linear = 10.0 ** (aug_cfg.gaussian_noise_snr_db / 10.0)
-    noise_std = 1.0 / (snr_linear ** 0.5)
-
-    return SpecAugment(
-        time_mask_pct=aug_cfg.time_mask_pct,
-        freq_mask_pct=aug_cfg.freq_mask_pct,
-        time_shift_pixels=shift_pixels,
-        noise_std=noise_std,
-    )
-
-
-def compute_eer(y_true: np.ndarray, y_scores: np.ndarray) -> float:
-    """Compute Equal Error Rate from true labels and prediction scores.
-
-    EER is the point where False Positive Rate equals False Negative Rate.
-    SRS: FR-CV-008. Q7 (EER scoring protocol) is OPEN for Phase 7 — this
-    implementation uses sklearn.metrics.roc_curve as the interim method.
-
-    Args:
-        y_true (np.ndarray): Binary labels (0=bonafide, 1=spoof).
-        y_scores (np.ndarray): Model confidence scores for class 1 (spoof).
-
-    Returns:
-        float: Equal Error Rate in [0.0, 1.0].
-    """
-    fpr, tpr, _ = roc_curve(y_true, y_scores)
-    fnr = 1.0 - tpr
-    eer_idx = int(np.argmin(np.abs(fpr - fnr)))
-    return float((fpr[eer_idx] + fnr[eer_idx]) / 2.0)
+  fpr, tpr, _ = roc_curve(y_true_np, y_scores_np)
+  fnr = 1.0 - tpr
+  idx = int(np.nanargmin(np.abs(fnr - fpr)))
+  return float((fnr[idx] + fpr[idx]) / 2.0)
 
 
 def train_epoch(
-    model: DSDBAModel,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-    scaler: torch.amp.GradScaler | None = None,
+  model: DSDBAModel,
+  loader: DataLoader[tuple[Tensor, int]],
+  optimizer: torch.optim.Optimizer,
+  criterion: nn.Module,
+  cfg: dict[str, Any],
 ) -> dict[str, float]:
-    """Run one training epoch with optional mixed precision.
+  """Train one epoch and return aggregated metrics."""
+  del cfg  # Reserved for future scheduler/AMP config expansion.
+  device = next(model.parameters()).device
+  model.train()
 
-    Args:
-        model: DSDBAModel in train mode.
-        loader: Training DataLoader yielding (tensor, label) batches.
-        optimizer: Optimizer (Adam).
-        criterion: Loss function (CrossEntropyLoss with class weights).
-        device: Target device (cuda / cpu).
-        scaler: GradScaler for mixed precision. None disables AMP.
+  total_loss = 0.0
+  correct = 0
+  total = 0
 
-    Returns:
-        dict with keys: "loss" (epoch mean), "samples_per_sec" (throughput).
-    """
-    model.train()
-    running_loss = 0.0
-    n_samples = 0
-    t_start = time.perf_counter()
+  for x, y in loader:
+    x = x.to(device)
+    y = y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    logits = model(x)
+    loss = criterion(logits, y)
+    loss.backward()
+    optimizer.step()
 
-    for batch_x, batch_y in loader:
-        batch_x = batch_x.to(device, dtype=torch.float32, non_blocking=True)
-        batch_y = batch_y.to(device, dtype=torch.long, non_blocking=True)
+    total_loss += float(loss.item()) * x.size(0)
+    pred = torch.argmax(logits, dim=1)
+    correct += int((pred == y).sum().item())
+    total += int(x.size(0))
 
-        optimizer.zero_grad(set_to_none=True)
-
-        if scaler is not None:
-            with torch.amp.autocast(device_type=device.type):
-                logits = model(batch_x)
-                loss = criterion(logits, batch_y)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            logits = model(batch_x)
-            loss = criterion(logits, batch_y)
-            loss.backward()
-            optimizer.step()
-
-        running_loss += loss.item() * batch_x.size(0)
-        n_samples += batch_x.size(0)
-
-    elapsed = time.perf_counter() - t_start
-    return {
-        "loss": running_loss / max(n_samples, 1),
-        "samples_per_sec": n_samples / max(elapsed, 1e-6),
-    }
+  avg_loss = total_loss / max(total, 1)
+  acc = correct / max(total, 1)
+  return {"train_loss": float(avg_loss), "train_acc": float(acc)}
 
 
 @torch.no_grad()
 def validate_epoch(
-    model: DSDBAModel,
-    loader: DataLoader,
-    device: torch.device,
+  model: DSDBAModel,
+  loader: DataLoader[tuple[Tensor, int]],
+  cfg: dict[str, Any],
 ) -> dict[str, float]:
-    """Run validation: compute loss, AUC-ROC, and EER on the full val set.
+  """Validate one epoch and return EER and AUC-ROC."""
+  del cfg
+  device = next(model.parameters()).device
+  model.eval()
 
-    Args:
-        model: DSDBAModel in eval mode (set internally).
-        loader: Validation DataLoader.
-        device: Target device.
+  y_true: list[int] = []
+  y_scores: list[float] = []
 
-    Returns:
-        dict with keys: "auc_roc", "eer", "loss".
-        SRS: FR-CV-008.
-    """
-    model.eval()
-    all_labels: list[int] = []
-    all_probs: list[float] = []
-    running_loss = 0.0
-    n_samples = 0
-    criterion = nn.CrossEntropyLoss()
+  for x, y in loader:
+    x = x.to(device)
+    logits = model(x)
+    spoof_scores = torch.sigmoid(logits[:, 1]).detach().cpu().numpy()
+    y_scores.extend(spoof_scores.tolist())
+    y_true.extend(y.numpy().tolist())
 
-    for batch_x, batch_y in loader:
-        batch_x = batch_x.to(device, dtype=torch.float32, non_blocking=True)
-        batch_y = batch_y.to(device, dtype=torch.long, non_blocking=True)
+  eer = compute_eer(y_true, y_scores)
+  try:
+    auc = float(roc_auc_score(y_true, y_scores))
+  except Exception:
+    auc = 0.5
 
-        logits = model(batch_x)
-        loss = criterion(logits, batch_y)
-        running_loss += loss.item() * batch_x.size(0)
-        n_samples += batch_x.size(0)
-
-        probs = torch.softmax(logits, dim=1)[:, 1]  # P(spoof)
-        all_labels.extend(batch_y.cpu().tolist())
-        all_probs.extend(probs.cpu().tolist())
-
-    y_true = np.array(all_labels)
-    y_scores = np.array(all_probs)
-
-    auc = float(roc_auc_score(y_true, y_scores)) if len(set(all_labels)) > 1 else 0.0
-    eer = compute_eer(y_true, y_scores) if len(set(all_labels)) > 1 else 1.0
-
-    return {
-        "auc_roc": auc,
-        "eer": eer,
-        "loss": running_loss / max(n_samples, 1),
-    }
+  return {"eer": float(eer), "auc_roc": float(auc)}
 
 
-def run_training(
-    cfg: DSDBAConfig,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    output_dir: pathlib.Path,
-    device: torch.device | None = None,
-) -> tuple[DSDBAModel, pathlib.Path]:
-    """Execute the full two-phase EfficientNet-B4 training protocol.
+def _save_checkpoint(path: Path, model: DSDBAModel, epoch: int, metrics: dict[str, float]) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  torch.save(
+    {
+      "epoch": epoch,
+      "model_state_dict": model.state_dict(),
+      "metrics": metrics,
+    },
+    path,
+  )
 
-    Phase 1 — Frozen backbone: train only the classification head for
-    cfg.model.frozen_epochs epochs [FR-CV-003].
-    Phase 2 — Fine-tune: unfreeze top 3 backbone stages, train at
-    lr ≤ cfg.model.finetune_lr with early stopping [FR-CV-003].
 
-    Checkpoint every epoch. Upload best to HF Hub if repo configured.
-    SRS: FR-CV-003–008.
+def _upload_checkpoint_to_hf(path: Path, cfg: dict[str, Any]) -> None:
+  repo_id = str(cfg["training"].get("hf_model_repo", "")).strip()
+  if not repo_id:
+    log_warning(stage="cv_train", message="hf_upload_skipped_empty_repo", data={})
+    return
 
-    Args:
-        cfg (DSDBAConfig): Full configuration.
-        train_loader (DataLoader): Training data.
-        val_loader (DataLoader): Validation data.
-        output_dir (pathlib.Path): Directory for .pth checkpoints.
-        device (torch.device | None): GPU/CPU. Auto-detects if None.
+  token_env = str(cfg["nlp"].get("hf_token_env_var", "HF_TOKEN"))
+  token = __import__("os").environ.get(token_env)
+  if not token:
+    log_warning(stage="cv_train", message="hf_upload_skipped_no_token", data={"env": token_env})
+    return
 
-    Returns:
-        tuple[DSDBAModel, pathlib.Path]: (trained model, best checkpoint path).
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  api = HfApi(token=token)
+  api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+  api.upload_file(
+    path_or_fileobj=str(path),
+    path_in_repo=path.name,
+    repo_id=repo_id,
+    repo_type="model",
+  )
+  log_info(stage="cv_train", message="hf_upload_ok", data={"repo_id": repo_id, "file": path.name})
 
-    model = build_model(pretrained=True)
-    model = model.to(device)
 
-    # Phase 1: frozen backbone [FR-CV-003]
-    model.freeze_backbone()
+def run_training(cfg: dict[str, Any]) -> DSDBAModel:
+  """[FR-CV-003..008] Run two-phase training and return trained model."""
+  root = Path(__file__).resolve().parents[2]
+  train_root = root / "data" / "train"
+  val_root = root / "data" / "validation"
 
-    class_weights = get_class_weights(
-        [label for _, label in train_loader.dataset], cfg.model.num_classes  # type: ignore[arg-type]
-    ).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+  train_files, train_labels = _resolve_dataset_paths(train_root)
+  val_files, val_labels = _resolve_dataset_paths(val_root)
+  if not train_files or not val_files:
+    raise ValueError("Training/validation data not found. Expected data/{train,validation}/{bonafide,spoof}")
 
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg.model.finetune_lr,
-    )
+  train_dataset = AudioClassificationDataset(
+    train_files,
+    train_labels,
+    cfg,
+    transform=build_augmentations(cfg),
+  )
+  val_dataset = AudioClassificationDataset(val_files, val_labels, cfg, transform=None)
 
-    scaler: torch.amp.GradScaler | None = None
-    if cfg.training.mixed_precision and device.type == "cuda":
-        scaler = torch.amp.GradScaler(device.type)
+  batch_size = int(cfg["training"]["batch_size"])
+  num_workers = int(cfg["training"].get("num_workers", 0))
+  train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+  val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-    best_auc: float = 0.0
-    best_path: pathlib.Path = output_dir / "best_model.pth"
-    patience_counter: int = 0
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  model = DSDBAModel(cfg=cfg, pretrained=True).to(device)
+  model.freeze_backbone()
 
-    total_epochs = cfg.training.max_epochs
-    frozen_epochs = cfg.model.frozen_epochs
+  class_weights = get_class_weights(train_dataset).to(device)
+  criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    for epoch in range(1, total_epochs + 1):
-        # Phase transition: unfreeze after frozen_epochs [FR-CV-003]
-        if epoch == frozen_epochs + 1:
-            model.unfreeze_top_n(3)
-            optimizer = torch.optim.Adam(
-                filter(lambda p: p.requires_grad, model.parameters()),
-                lr=cfg.model.finetune_lr,
-            )
-            log_info(
-                stage="CV Training",
-                message=f"Phase 2: unfroze top 3 backbone stages at epoch {epoch}",
-                srs_ref="FR-CV-003",
-            )
+  frozen_epochs = int(cfg["model"].get("frozen_epochs", 5))
+  max_epochs = int(cfg["training"].get("max_epochs", 30))
+  finetune_lr = float(cfg["model"].get("finetune_lr", 1e-4))
+  phase1_lr = min(1e-3, finetune_lr)
 
-        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
-        val_metrics = validate_epoch(model, val_loader, device)
+  best_auc = -math.inf
+  best_path = Path(__file__).resolve().parents[2] / "models" / "checkpoints" / "best_model.pth"
+  patience = int(cfg["training"].get("early_stopping_patience", 5))
+  no_improve = 0
 
-        log_info(
-            stage="CV Training",
-            message=f"Epoch {epoch}/{total_epochs}",
-            srs_ref="FR-CV-008",
-            data={
-                "train_loss": round(train_metrics["loss"], 4),
-                "val_loss": round(val_metrics["loss"], 4),
-                "val_auc_roc": round(val_metrics["auc_roc"], 4),
-                "val_eer": round(val_metrics["eer"], 4),
-                "samples_per_sec": round(train_metrics["samples_per_sec"], 1),
-                "phase": "frozen" if epoch <= frozen_epochs else "finetune",
-            },
-        )
-
-        # Checkpoint every epoch [NFR-Reliability]
-        if cfg.training.save_every_epoch:
-            ckpt_path = output_dir / f"epoch_{epoch:03d}.pth"
-            torch.save(model.state_dict(), ckpt_path)
-
-        # Track best model by AUC-ROC [FR-CV-008]
-        if val_metrics["auc_roc"] > best_auc:
-            best_auc = val_metrics["auc_roc"]
-            torch.save(model.state_dict(), best_path)
-            patience_counter = 0
-            log_info(
-                stage="CV Training",
-                message=f"New best AUC-ROC: {best_auc:.4f} — saved {best_path.name}",
-                srs_ref="FR-CV-007",
-            )
-        else:
-            patience_counter += 1
-
-        # Early stopping [FR-CV-003]
-        if patience_counter >= cfg.training.early_stopping_patience:
-            log_info(
-                stage="CV Training",
-                message=f"Early stopping at epoch {epoch} (patience={cfg.training.early_stopping_patience})",
-                srs_ref="FR-CV-003",
-            )
-            break
-
-    # Upload best checkpoint to HF Hub [FR-CV-007]
-    hf_repo = cfg.training.hf_model_repo
-    if hf_repo:
-        try:
-            from huggingface_hub import HfApi
-
-            api = HfApi()
-            api.upload_file(
-                path_or_fileobj=str(best_path),
-                path_in_repo="best_model.pth",
-                repo_id=hf_repo,
-            )
-            log_info(
-                stage="CV Training",
-                message=f"Best checkpoint uploaded to HF Hub: {hf_repo}",
-                srs_ref="FR-CV-007",
-            )
-        except Exception as exc:
-            log_warning(
-                stage="CV Training",
-                message=f"HF Hub upload failed: {type(exc).__name__}",
-                srs_ref="FR-CV-007",
-            )
+  # Phase 1: head-only training.
+  optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=phase1_lr)
+  for epoch in range(1, min(frozen_epochs, max_epochs) + 1):
+    train_metrics = train_epoch(model, train_loader, optimizer, criterion, cfg)
+    val_metrics = validate_epoch(model, val_loader, cfg)
+    merged = {**train_metrics, **val_metrics}
+    _save_checkpoint(best_path.with_name(f"epoch_{epoch:02d}.pth"), model, epoch, merged)
+    if val_metrics["auc_roc"] > best_auc:
+      best_auc = val_metrics["auc_roc"]
+      _save_checkpoint(best_path, model, epoch, merged)
+      no_improve = 0
     else:
-        log_warning(
-            stage="CV Training",
-            message="HF model repo not configured — skipping upload",
-            srs_ref="FR-CV-007",
-        )
+      no_improve += 1
 
-    # Reload best weights
-    model.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
-    model.eval()
+    log_info(stage="cv_train", message="phase1_epoch_complete", data={"epoch": epoch, **merged})
+    if no_improve >= patience:
+      break
 
-    return model, best_path
+  # Phase 2: fine-tuning top layers.
+  if max_epochs > frozen_epochs:
+    model.unfreeze_top_n(n=2)
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=min(finetune_lr, 1e-4))
+    for epoch in range(frozen_epochs + 1, max_epochs + 1):
+      train_metrics = train_epoch(model, train_loader, optimizer, criterion, cfg)
+      val_metrics = validate_epoch(model, val_loader, cfg)
+      merged = {**train_metrics, **val_metrics}
+      _save_checkpoint(best_path.with_name(f"epoch_{epoch:02d}.pth"), model, epoch, merged)
+      if val_metrics["auc_roc"] > best_auc:
+        best_auc = val_metrics["auc_roc"]
+        _save_checkpoint(best_path, model, epoch, merged)
+        no_improve = 0
+      else:
+        no_improve += 1
+
+      log_info(stage="cv_train", message="phase2_epoch_complete", data={"epoch": epoch, **merged})
+      if no_improve >= patience:
+        break
+
+  _upload_checkpoint_to_hf(best_path, cfg)
+  return model
+
+
+if __name__ == "__main__":
+  cfg_path = Path(__file__).resolve().parents[2] / "config.yaml"
+  cfg_data = yaml.safe_load(cfg_path.read_text())
+  run_training(cfg_data)

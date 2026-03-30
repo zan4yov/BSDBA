@@ -4,8 +4,6 @@
 # Document: DSDBA-SRS-2026-002 v2.1
 # RULE: No hyperparameter may appear hardcoded in any Python source file.
 #       All values here are the single source of truth. NFR-Maintainability.
-# STATUS: LOCKED after Phase 2 Gate Check (2026-03-18).
-#         No changes permitted without a formal Phase 2 amendment.
 # =============================================================================
 
 # ── Audio DSP Module (FR-AUD-001–011) ─────────────────────────────────────────
@@ -25,9 +23,7 @@ audio:
   error_code_bad_format: AUD-002      # FR-AUD-001: unsupported format error
   supported_formats: [wav, flac]      # FR-AUD-001: SHALL-level formats
   optional_formats: [mp3, ogg]        # FR-AUD-011: MAY-level formats
-  resampling_method: kaiser_best      # FR-AUD-002: resampling quality (requires resampy in requirements.txt)
-  fmin: 0.0                           # FR-AUD-006 / Q5 RESOLVED: Mel filter bank minimum Hz
-  fmax: 8000                          # FR-AUD-006 / Q5 RESOLVED: Mel filter bank maximum Hz (= sample_rate / 2)
+  resampling_method: kaiser_best      # FR-AUD-002: resampling quality
 
 # ── Computer Vision Module (FR-CV-001–009) ───────────────────────────────────
 model:
@@ -45,7 +41,7 @@ model:
 # ── Training Configuration (FR-CV-003–008) ───────────────────────────────────
 training:
   batch_size: 16                      # Q3: verify VRAM feasibility before Sprint B
-  gradient_checkpointing: true        # Q3 mitigation: required on Colab Free Tier
+  gradient_checkpointing: false       # Q3 resolved: empirical Colab run shows batch 16 fits without checkpointing
   mixed_precision: true               # Recommended for T4 GPU efficiency
   num_workers: 2                      # DataLoader workers (Colab CPU count)
   max_epochs: 30                      # Max training epochs
@@ -53,7 +49,7 @@ training:
   save_every_epoch: true              # NFR-Reliability: checkpoint every epoch
   dataset_split: for_2sec             # Q2 RESOLVED: FoR 2-second variant
   dataset_source: kaggle              # FoR Dataset by M. Abdel-Dayem
-  hf_model_repo: "https://huggingface.co/zanvvr/dsdba-efficientnet-b4"                   # FR-CV-007: fill with your HF model repo ID
+  hf_model_repo: ""                   # FR-CV-007: fill with your HF model repo ID
 
   # SpecAugment (FR-CV-006 — SHOULD)
   augmentation:
@@ -74,11 +70,13 @@ acceptance_criteria:
 
 # ── Grad-CAM / XAI Module (FR-CV-010–016) ────────────────────────────────────
 gradcam:
-  target_layer: "model.features[7][-1]"  # FR-CV-010/011: Q4 RESOLVED — final MBConv block, Stage 7 (named: features.7.1)
+  # FR-CV-010/011: Q4 layer = EfficientNet-B4 features[8]; DSDBAModel exposes it via backbone (eval path).
+  target_layer: "model.backbone.features[8]"
   library: pytorch_grad_cam            # FR-CV-011: jacobgil/pytorch-grad-cam
   colormap: jet                        # FR-CV-012: overlay colormap
   overlay_alpha: 0.5                   # FR-CV-012: blending alpha
   output_format: png                   # FR-CV-012: heatmap output format
+  heatmap_output_dir: outputs/gradcam  # FR-CV-012: PNG output directory (project-relative)
   # Frequency band boundaries in Hz (FR-CV-013)
   band_hz:
     low: [0, 500]                      # Band 1: 0–500 Hz
@@ -88,11 +86,12 @@ gradcam:
   band_normalisation: softmax          # FR-CV-014: Softmax → bands sum to 100%
   latency_target_ms: 3000              # FR-CV-015: ≤ 3,000 ms on CPU
   expose_raw_saliency: true            # FR-CV-016: JSON endpoint for dev access
+  cam_target_class_index: 1            # FR-CV-011: ClassifierOutputTarget index (1 = spoof logit)
 
 # ── NLP / Qwen 2.5 Module (FR-NLP-001–009) ───────────────────────────────────
 nlp:
-  primary_provider: qwen3-plus      # was: qwen_2.5 — updated to current model
-  fallback_provider: qwen-plus      # Qwen-Plus as first fallback
+  primary_provider: qwen_2.5           # FR-NLP-002: primary LLM (Q1 RESOLVED)
+  fallback_provider: gemma_3           # FR-NLP-007: secondary LLM fallback
   final_fallback: rule_based           # FR-NLP-003: always-available template
   timeout_sec: 30                      # FR-NLP-002: API call timeout
   explanation_min_sentences: 3         # FR-NLP-001: prompt instruction
@@ -102,6 +101,25 @@ nlp:
   # API credentials: NEVER stored here — use HF Spaces secrets [FR-NLP-005]
   api_key_env_var: QWEN_API_KEY        # Name of the Spaces secret (not the value)
   hf_token_env_var: HF_TOKEN           # Name of the HF token secret
+  # OpenAI-compatible endpoints (non-secret; override per deployment) [FR-NLP-002, FR-NLP-007]
+  qwen:
+    openai_compatible_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    model: "qwen-turbo"
+  gemma:
+    openai_compatible_base_url: "https://api-inference.huggingface.co/v1"
+    model: "google/gemma-2-9b-it"
+  # Human-readable band names for prompts and rule fallback [FR-NLP-001, FR-NLP-004]
+  band_display_names:
+    low: "low (0–500 Hz)"
+    low_mid: "low-mid (500 Hz–2 kHz)"
+    high_mid: "high-mid (2–4 kHz)"
+    high: "high (4–8 kHz)"
+  # Rule-based narrative fragments (no API) [FR-NLP-003, FR-NLP-004]
+  rule_narrative:
+    spoof_top_band_hint: "patterns consistent with synthetic or manipulated speech in that region"
+    bonafide_top_band_hint: "patterns consistent with natural vocal energy in that region"
+    spoof_followup: "The model prioritised spoof-related cues aligned with this frequency emphasis."
+    bonafide_followup: "The model emphasised natural-speech cues consistent with this frequency emphasis."
 
   # NLP caching (FR-NLP-008 — SHOULD)
   caching:
@@ -111,7 +129,7 @@ nlp:
 
 # ── Deployment / UI Module (FR-DEP-001–010) ──────────────────────────────────
 deployment:
-  framework: gradio                    # FR-DEP-001: Q6 RESOLVED — Gradio 4.x locked (ADR-0006)
+  framework: gradio                    # FR-DEP-001: lock choice here — Q6 pending
   gradio_version: "4"                  # FR-DEP-001: Gradio 4.x
   auth_required: false                 # FR-DEP-001: public access, no login
   max_upload_mb: 20                    # FR-DEP-002: max audio file size

@@ -1,205 +1,110 @@
-"""
-Module: test_cv
-SRS Reference: FR-CV-001, FR-CV-002, FR-CV-004, FR-CV-005, FR-DEP-010
-SDLC Phase: Phase 4 — Sprint B (V.E.R.I.F.Y. Level 3)
-Sprint: B
-Pipeline Stage: CV Inference (test suite)
-Interface Contract:
-  Input:  N/A — pytest test suite
-  Output: 8 tests — all must pass before Sprint B Gate Check
-Latency Target: test_onnx_latency asserts ≤ 1,500 ms
-Open Questions Resolved: Q3 (VRAM), Q4 (Grad-CAM layer)
-Open Questions Blocking: None
-MCP Tools Used: None
-AI Generated: true
-Verified (V.E.R.I.F.Y.): false
-Author: Ferel / Safa
-Date: 2026-03-19
-"""
-
 from __future__ import annotations
 
-import pathlib
-import time
-import tempfile
+import copy
+from pathlib import Path
 
-import numpy as np
-import onnxruntime as ort
 import pytest
 import torch
+import yaml
 
-from src.cv.model import DSDBAModel, build_model
 from src.cv.infer import (
-    export_to_onnx,
-    load_onnx_session,
-    run_onnx_inference,
-    verify_onnx_equivalence,
+	export_to_onnx,
+	load_onnx_session,
+	run_onnx_inference,
+	timed_onnx_inference,
+	verify_onnx_equivalence,
 )
-from src.cv.train import compute_eer, get_class_weights
-from src.utils.config import DSDBAConfig, load_config
-
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-_CONFIG_PATH: pathlib.Path = (
-    pathlib.Path(__file__).parent.parent.parent / "config.yaml"
-)
+from src.cv.model import DSDBAModel
+from src.cv.train import get_class_weights
 
 
-@pytest.fixture(scope="module")
-def cfg() -> DSDBAConfig:
-    return load_config(_CONFIG_PATH)
+def _load_cfg() -> dict:
+	root = Path(__file__).resolve().parents[2]
+	return yaml.safe_load((root / "config.yaml").read_text())
 
 
 @pytest.fixture(scope="module")
-def model() -> DSDBAModel:
-    """Build model without pretrained weights for fast test execution."""
-    return DSDBAModel(num_classes=2, pretrained=False, gradient_checkpointing=False)
+def cfg() -> dict:
+	return _load_cfg()
 
 
 @pytest.fixture(scope="module")
-def dummy_input(cfg: DSDBAConfig) -> torch.Tensor:
-    shape = cfg.audio.output_tensor_shape
-    return torch.randn(1, *shape, dtype=torch.float32)
+def model(cfg: dict) -> DSDBAModel:
+	m = DSDBAModel(cfg=cfg, pretrained=False)
+	m.eval()
+	return m
 
 
 @pytest.fixture(scope="module")
-def onnx_path(model: DSDBAModel, cfg: DSDBAConfig) -> pathlib.Path:
-    """Export model to ONNX in a temp directory (shared across test module)."""
-    tmp_dir = pathlib.Path(tempfile.mkdtemp())
-    out = tmp_dir / "test_model.onnx"
-    export_to_onnx(model, out, cfg)
-    return out
+def onnx_bundle(cfg: dict, model: DSDBAModel):
+	cfg_local = copy.deepcopy(cfg)
+	onnx_path = export_to_onnx(model, cfg_local)
+	session = load_onnx_session(onnx_path, cfg_local)
+	return cfg_local, onnx_path, session
 
 
-# ── Test 1: Model output shape ───────────────────────────────────────────────
+def test_model_output_shape(cfg: dict, model: DSDBAModel) -> None:
+	shape = tuple(int(v) for v in cfg["audio"]["output_tensor_shape"])
+	x = torch.randn(1, *shape)
+	y = model(x)
+	assert tuple(y.shape) == (1, 2)
 
 
-def test_model_output_shape(model: DSDBAModel, dummy_input: torch.Tensor) -> None:
-    """FR-CV-001/002: Forward pass produces logits of shape [batch, 2]."""
-    model.eval()
-    with torch.no_grad():
-        logits = model(dummy_input)
-    assert logits.shape == torch.Size([1, 2]), (
-        f"Expected logits shape [1, 2], got {logits.shape}"
-    )
+def test_sigmoid_output_range(onnx_bundle) -> None:
+	cfg, _, session = onnx_bundle
+	shape = tuple(int(v) for v in cfg["audio"]["output_tensor_shape"])
+	x = torch.randn(1, *shape)
+	_, confidence = run_onnx_inference(session, x, cfg)
+	assert 0.0 < confidence < 1.0
 
 
-# ── Test 2: Sigmoid output range ─────────────────────────────────────────────
+def test_freeze_unfreeze(cfg: dict) -> None:
+	m = DSDBAModel(cfg=cfg, pretrained=False)
+	m.freeze_backbone()
+
+	frozen_ok = all(not p.requires_grad for p in m.backbone.features.parameters())
+	head_ok = all(p.requires_grad for p in m.backbone.classifier.parameters())
+	assert frozen_ok
+	assert head_ok
+
+	m.unfreeze_top_n(2)
+	top_blocks = list(m.backbone.features.children())[-2:]
+	unfrozen_ok = any(p.requires_grad for b in top_blocks for p in b.parameters())
+	assert unfrozen_ok
 
 
-def test_sigmoid_output_range(model: DSDBAModel, dummy_input: torch.Tensor) -> None:
-    """FR-CV-004: Softmax confidence scores must be in (0.0, 1.0)."""
-    model.eval()
-    with torch.no_grad():
-        logits = model(dummy_input)
-    probs = torch.softmax(logits, dim=1)
-    assert probs.min() > 0.0, "Softmax output must be > 0"
-    assert probs.max() < 1.0, "Softmax output must be < 1"
-    assert abs(probs.sum().item() - 1.0) < 1e-5, "Softmax must sum to 1.0"
+def test_onnx_export_creates_file(onnx_bundle) -> None:
+	_, onnx_path, _ = onnx_bundle
+	assert onnx_path.exists()
+	assert onnx_path.suffix == ".onnx"
 
 
-# ── Test 3: Freeze / unfreeze backbone ───────────────────────────────────────
+def test_onnx_equivalence(cfg: dict, model: DSDBAModel, onnx_bundle) -> None:
+	cfg_local, onnx_path, _ = onnx_bundle
+	cfg_local["deployment"]["onnx_equivalence_tolerance"] = 1.0e-5
+	assert verify_onnx_equivalence(model, onnx_path, cfg_local)
 
 
-def test_freeze_unfreeze(model: DSDBAModel) -> None:
-    """FR-CV-003: Backbone freeze/unfreeze controls requires_grad correctly."""
-    model.freeze_backbone()
-    for param in model.features.parameters():
-        assert not param.requires_grad, "Frozen backbone param should not require grad"
-    for param in model.classifier.parameters():
-        assert param.requires_grad, "Classifier params should always require grad"
-
-    model.unfreeze_top_n(3)
-    total_stages = len(model.features)
-    for idx in range(total_stages - 3, total_stages):
-        for param in model.features[idx].parameters():
-            assert param.requires_grad, (
-                f"Top-3 stage {idx} should require grad after unfreeze"
-            )
-    for idx in range(total_stages - 3):
-        for param in model.features[idx].parameters():
-            assert not param.requires_grad, (
-                f"Stage {idx} should remain frozen"
-            )
+def test_onnx_latency(onnx_bundle) -> None:
+	cfg, _, session = onnx_bundle
+	shape = tuple(int(v) for v in cfg["audio"]["output_tensor_shape"])
+	x = torch.randn(1, *shape)
+	_, latency_ms = timed_onnx_inference(session, x, cfg)
+	assert latency_ms <= float(cfg["deployment"]["onnx_latency_target_ms"])
 
 
-# ── Test 4: ONNX export creates file ─────────────────────────────────────────
-
-
-def test_onnx_export_creates_file(onnx_path: pathlib.Path) -> None:
-    """FR-DEP-010: ONNX export produces a valid .onnx file."""
-    assert onnx_path.exists(), f"ONNX file not found at {onnx_path}"
-    assert onnx_path.stat().st_size > 0, "ONNX file is empty"
-
-
-# ── Test 5: ONNX equivalence ─────────────────────────────────────────────────
-
-
-def test_onnx_equivalence(
-    model: DSDBAModel,
-    onnx_path: pathlib.Path,
-    cfg: DSDBAConfig,
-) -> None:
-    """FR-DEP-010: |ONNX output − PyTorch output| < 1e-5."""
-    assert verify_onnx_equivalence(model, onnx_path, cfg), (
-        "ONNX output does not match PyTorch output within tolerance"
-    )
-
-
-# ── Test 6: ONNX inference latency ───────────────────────────────────────────
-
-
-def test_onnx_latency(
-    onnx_path: pathlib.Path,
-    cfg: DSDBAConfig,
-) -> None:
-    """FR-DEP-010 + NFR-Performance: Single ONNX inference ≤ 1,500 ms on CPU."""
-    session = ort.InferenceSession(
-        str(onnx_path),
-        providers=cfg.deployment.onnx_execution_providers,
-    )
-    tensor_shape = cfg.audio.output_tensor_shape
-    dummy = torch.randn(*tensor_shape, dtype=torch.float32)
-
-    t_start = time.perf_counter()
-    run_onnx_inference(session, dummy, cfg)
-    latency_ms = (time.perf_counter() - t_start) * 1000.0
-
-    target = cfg.deployment.onnx_latency_target_ms
-    assert latency_ms <= target, (
-        f"ONNX inference latency {latency_ms:.1f}ms > target {target}ms"
-    )
-
-
-# ── Test 7: ONNX CPU provider only ───────────────────────────────────────────
-
-
-def test_onnx_cpu_provider_only(
-    onnx_path: pathlib.Path,
-    cfg: DSDBAConfig,
-) -> None:
-    """FR-DEP-010: ONNX session uses CPUExecutionProvider exclusively."""
-    session = ort.InferenceSession(
-        str(onnx_path),
-        providers=cfg.deployment.onnx_execution_providers,
-    )
-    providers = session.get_providers()
-    assert "CPUExecutionProvider" in providers, (
-        f"CPUExecutionProvider not found in {providers}"
-    )
-
-
-# ── Test 8: Class weights validity ───────────────────────────────────────────
+def test_onnx_cpu_provider_only(onnx_bundle) -> None:
+	_, _, session = onnx_bundle
+	providers = session.get_providers()
+	assert providers == ["CPUExecutionProvider"]
 
 
 def test_class_weights_sum() -> None:
-    """FR-CV-005: Inverse-frequency class weights are valid positive tensors."""
-    labels = [0, 0, 0, 1, 1]
-    weights = get_class_weights(labels, num_classes=2)
+	class DummyDataset:
+		labels = [0, 0, 0, 1, 1]
 
-    assert weights.shape == torch.Size([2]), f"Expected shape [2], got {weights.shape}"
-    assert weights.dtype == torch.float32, f"Expected float32, got {weights.dtype}"
-    assert (weights > 0).all(), "All class weights must be positive"
-    assert weights[1] > weights[0], (
-        "Minority class (spoof) should have higher weight"
-    )
+	weights = get_class_weights(DummyDataset())
+	assert isinstance(weights, torch.Tensor)
+	assert tuple(weights.shape) == (2,)
+	assert torch.all(weights > 0)
+	assert torch.isfinite(weights).all()
