@@ -44,12 +44,34 @@ _CONFIG_PATH: pathlib.Path = (
 _CFG: DSDBAConfig = load_config(_CONFIG_PATH)
 _log = get_logger(__name__)
 
+
+def _to_audio_cfg(cfg: AudioConfig | DSDBAConfig | dict | None) -> AudioConfig:
+    """Normalise any cfg form into an AudioConfig instance.
+
+    Accepts:
+    - None                 → module-level _CFG.audio
+    - AudioConfig          → returned as-is
+    - DSDBAConfig          → .audio extracted
+    - dict with 'audio' key → AudioConfig.model_validate(cfg['audio'])
+    - dict without 'audio' → AudioConfig.model_validate(cfg)
+    """
+    if cfg is None:
+        return _CFG.audio
+    if isinstance(cfg, AudioConfig):
+        return cfg
+    if isinstance(cfg, DSDBAConfig):
+        return cfg.audio
+    if isinstance(cfg, dict):
+        return AudioConfig.model_validate(cfg["audio"] if "audio" in cfg else cfg)
+    return cfg  # fallback — caller's responsibility
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 
 def load_audio(
     file_path: pathlib.Path,
-    cfg: AudioConfig,
+    cfg: AudioConfig | DSDBAConfig | dict | None = None,
 ) -> tuple[np.ndarray, int]:
     """Load an audio file and return the waveform and native sample rate.
 
@@ -74,6 +96,7 @@ def load_audio(
                     SRS: FR-AUD-001.
         OSError: if file cannot be opened (re-raised from soundfile/torchaudio).
     """
+    cfg = _to_audio_cfg(cfg)
     suffix = file_path.suffix.lower().lstrip(".")
     all_formats: list[str] = cfg.supported_formats + cfg.optional_formats
 
@@ -105,7 +128,7 @@ def load_audio(
 def validate_duration(
     waveform: np.ndarray,
     sample_rate: int,
-    cfg: AudioConfig,
+    cfg: AudioConfig | DSDBAConfig | dict | None = None,
 ) -> None:
     """Reject audio clips shorter than the minimum accepted duration.
 
@@ -121,6 +144,7 @@ def validate_duration(
         DSDBAError: code=AUD-001 if duration < cfg.min_duration_sec (0.5 s).
                     SRS: FR-AUD-005.
     """
+    cfg = _to_audio_cfg(cfg)
     n_samples: int = waveform.shape[-1]
     duration: float = n_samples / sample_rate
 
@@ -138,7 +162,7 @@ def validate_duration(
 def resample_audio(
     waveform: np.ndarray,
     orig_sr: int,
-    cfg: AudioConfig,
+    cfg: AudioConfig | DSDBAConfig | dict | None = None,
 ) -> np.ndarray:
     """Resample the waveform to the target sample rate using Kaiser-best window.
 
@@ -159,6 +183,7 @@ def resample_audio(
     quality is required by FR-AUD-002 despite higher CPU cost than soxr_hq.
     [TECH DEBT: resampy==0.4.2 compatibility unverified — see session-cheatsheet.md]
     """
+    cfg = _to_audio_cfg(cfg)
     if orig_sr == cfg.sample_rate:
         return waveform
 
@@ -198,7 +223,7 @@ def to_mono(waveform: np.ndarray) -> np.ndarray:
     return mono
 
 
-def fix_duration(waveform: np.ndarray, cfg: AudioConfig) -> np.ndarray:
+def fix_duration(waveform: np.ndarray, cfg: AudioConfig | DSDBAConfig | dict | None = None) -> np.ndarray:
     """Pad or trim the waveform to exactly cfg.n_samples (32,000 samples).
 
     - Longer clips: centre-crop to preserve the most informative region.
@@ -213,6 +238,7 @@ def fix_duration(waveform: np.ndarray, cfg: AudioConfig) -> np.ndarray:
         np.ndarray: Waveform of shape (cfg.n_samples,), dtype float32.
                     Exactly 2.0 seconds at 16,000 Hz. SRS: FR-AUD-004.
     """
+    cfg = _to_audio_cfg(cfg)
     n: int = len(waveform)
     target: int = cfg.n_samples
 
@@ -227,7 +253,7 @@ def fix_duration(waveform: np.ndarray, cfg: AudioConfig) -> np.ndarray:
     return np.pad(waveform, (0, pad_width), mode="constant").astype(np.float32)
 
 
-def extract_mel_spectrogram(waveform: np.ndarray, cfg: AudioConfig) -> np.ndarray:
+def extract_mel_spectrogram(waveform: np.ndarray, cfg: AudioConfig | DSDBAConfig | dict | None = None) -> np.ndarray:
     """Compute a Mel-scaled power spectrogram from a mono waveform.
 
     Parameters sourced exclusively from config.yaml:audio. [NFR-Maintainability]
@@ -244,6 +270,7 @@ def extract_mel_spectrogram(waveform: np.ndarray, cfg: AudioConfig) -> np.ndarra
         np.ndarray: Power Mel spectrogram, shape (n_mels, T) = (128, frames),
                     dtype float32. T ≈ 63 for 32,000-sample input at hop=512.
     """
+    cfg = _to_audio_cfg(cfg)
     mel_spec: np.ndarray = librosa.feature.melspectrogram(
         y=waveform,
         sr=cfg.sample_rate,
@@ -286,7 +313,7 @@ def normalise_spectrogram(spec: np.ndarray) -> np.ndarray:
     return spec_norm
 
 
-def to_tensor(spec: np.ndarray, cfg: AudioConfig) -> torch.Tensor:
+def to_tensor(spec: np.ndarray, cfg: AudioConfig | DSDBAConfig | dict | None = None) -> torch.Tensor:
     """Resize the spectrogram to 224×224 and replicate to 3 channels.
 
     Uses bilinear interpolation to match EfficientNet-B4's ImageNet input
@@ -306,6 +333,7 @@ def to_tensor(spec: np.ndarray, cfg: AudioConfig) -> torch.Tensor:
     Raises:
         DSDBAError: code=CV-001 if output shape or dtype assertion fails.
     """
+    cfg = _to_audio_cfg(cfg)
     out_h: int = cfg.output_tensor_shape[1]
     out_w: int = cfg.output_tensor_shape[2]
 
@@ -343,7 +371,7 @@ def to_tensor(spec: np.ndarray, cfg: AudioConfig) -> torch.Tensor:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
-def preprocess_audio(file_path: pathlib.Path) -> torch.Tensor:
+def preprocess_audio(file_path: pathlib.Path, cfg: AudioConfig | DSDBAConfig | dict | None = None) -> torch.Tensor:
     """Load, validate, and transform an audio file into a [3, 224, 224] float32 tensor.
 
     This is the sole public entry point for the Audio DSP stage. It composes
@@ -386,7 +414,7 @@ def preprocess_audio(file_path: pathlib.Path) -> torch.Tensor:
     MCP Tools Used: context7-mcp (librosa 0.10.x)
     """
     t_start: float = time.perf_counter()
-    cfg: AudioConfig = _CFG.audio
+    cfg: AudioConfig = _to_audio_cfg(cfg)
 
     # Steps 1–2: load (includes format validation)
     waveform, orig_sr = load_audio(file_path, cfg)
