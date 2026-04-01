@@ -143,7 +143,7 @@
 |---------|------|---------|---------|
 | Session 03 | [TECH DEBT: Grad-CAM smoke-test (non-zero saliency assertion) deferred to Sprint C setup — Colab env required] | FR-CV-010 | HIGH — must pass before Sprint C Gate Check |
 | Session 03 | [TECH DEBT: `resampy==0.4.2` version pin not verified against librosa 0.10.1 compatibility — verify in Sprint A Colab setup] | FR-AUD-002 | MEDIUM — fallback: change `audio.resampling_method` to `soxr_hq` if resampy fails |
-| Session 04 | [TECH DEBT: `notebooks/dsdba_training.ipynb` Cell 4 + Cell 5 use placeholder HF dataset repo ID `your-username/fake-or-real` — fill in actual repo ID before Sprint B] | FR-CV-007 | MEDIUM — blocks dataset download in Colab |
+| Session 04 | ~~[TECH DEBT: `notebooks/dsdba_training.ipynb` Cell 4 + Cell 5 use placeholder HF dataset repo ID — RESOLVED in Sprint C/D sync: Kaggle source (`mohammedabdeldayem/the-fake-or-real-dataset`) + Colab Secrets wiring implemented]~~ | FR-CV-007 | RESOLVED |
 | Session 06 | [TECH DEBT: Local env onnxruntime 1.24.4 vs pinned 1.16.3 in requirements.txt — ONNX opset 17 compatible with both. Verify on Colab] | FR-DEP-010 | LOW — tests pass on both versions |
 | Session 06 | [TECH DEBT: `torch.onnx.export()` deprecation warning for `dynamic_axes` on newer torch — Colab torch==2.1.0 uses legacy API, no action needed] | FR-DEP-010 | LOW — cosmetic warning only |
 
@@ -250,5 +250,5 @@
 **Tech Debt Logged:**
 - [TECH DEBT: Local env uses onnxruntime 1.24.4 + onnxscript 0.6.2 (Python 3.13) vs pinned onnx==1.14.1 + onnxruntime==1.16.3 in requirements.txt (Python 3.10, Colab). ONNX export uses opset 17 which is compatible with both versions. Tests pass on local; Colab compatibility assumed | SRS-ref: FR-DEP-010]
 - [TECH DEBT: `torch.onnx.export()` shows deprecation warning for `dynamic_axes` (new torch prefers `dynamic_shapes`). Colab with torch==2.1.0 uses legacy API — no change needed | SRS-ref: FR-DEP-010]
-- [TECH DEBT: Notebook Cells 4/5 still use placeholder HF dataset repo ID `your-username/fake-or-real` — fill before running training | SRS-ref: FR-CV-007]
+- ~~[TECH DEBT: Notebook Cells 4/5 placeholder RESOLVED — Kaggle source (`mohammedabdeldayem/the-fake-or-real-dataset`) + Colab Secrets wiring implemented in Sprint C/D sync | SRS-ref: FR-CV-007]~~
 **Next:** Run Chain 07 — Sprint C: `src/cv/gradcam.py` implementation (FR-CV-010–016). Entry criteria: Q4 Grad-CAM smoke-test in Colab.
