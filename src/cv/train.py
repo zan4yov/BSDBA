@@ -64,9 +64,18 @@ class AudioClassificationDataset(Dataset[tuple[Tensor, int]]):
 
 
 def _resolve_dataset_paths(root: Path) -> tuple[list[Path], list[int]]:
-  """Resolve audio file paths and labels from bonafide/spoof folders."""
+  """Resolve audio file paths and labels from class-named subdirectories.
+
+  Supports both canonical SRS names (bonafide/spoof) and FoR Kaggle names
+  (real/fake) so run_training() works on the raw Kaggle extraction without
+  renaming directories.
+  """
   exts = {".wav", ".flac", ".mp3", ".ogg"}
-  pairs = [("bonafide", 0), ("spoof", 1)]
+  # Prefer SRS canonical names; fall back to FoR Kaggle names automatically.
+  if (root / "bonafide").exists():
+    pairs = [("bonafide", 0), ("spoof", 1)]
+  else:
+    pairs = [("real", 0), ("fake", 1)]
   file_paths: list[Path] = []
   labels: list[int] = []
   for class_name, label in pairs:
@@ -162,10 +171,16 @@ def train_epoch(
   optimizer: torch.optim.Optimizer,
   criterion: nn.Module,
   cfg: dict[str, Any],
+  scaler: torch.amp.GradScaler | None = None,
 ) -> dict[str, float]:
-  """Train one epoch and return aggregated metrics."""
-  del cfg  # Reserved for future scheduler/AMP config expansion.
+  """Train one epoch and return aggregated metrics.
+
+  Args:
+    scaler: Optional GradScaler for mixed-precision training (FR-CV-003,
+            config.yaml training.mixed_precision). Pass None for FP32.
+  """
   device = next(model.parameters()).device
+  use_amp = scaler is not None and device.type == "cuda"
   model.train()
 
   total_loss = 0.0
@@ -176,10 +191,18 @@ def train_epoch(
     x = x.to(device)
     y = y.to(device)
     optimizer.zero_grad(set_to_none=True)
-    logits = model(x)
-    loss = criterion(logits, y)
-    loss.backward()
-    optimizer.step()
+
+    with torch.amp.autocast("cuda", enabled=use_amp):
+      logits = model(x)
+      loss = criterion(logits, y)
+
+    if use_amp and scaler is not None:
+      scaler.scale(loss).backward()
+      scaler.step(optimizer)
+      scaler.update()
+    else:
+      loss.backward()
+      optimizer.step()
 
     total_loss += float(loss.item()) * x.size(0)
     pred = torch.argmax(logits, dim=1)
@@ -292,6 +315,9 @@ def run_training(cfg: dict[str, Any]) -> DSDBAModel:
   finetune_lr = float(cfg["model"].get("finetune_lr", 1e-4))
   phase1_lr = min(1e-3, finetune_lr)
 
+  use_amp = bool(cfg["training"].get("mixed_precision", False)) and device.type == "cuda"
+  scaler: torch.amp.GradScaler | None = torch.amp.GradScaler("cuda") if use_amp else None
+
   best_auc = -math.inf
   best_path = Path(__file__).resolve().parents[2] / "models" / "checkpoints" / "best_model.pth"
   patience = int(cfg["training"].get("early_stopping_patience", 5))
@@ -300,7 +326,7 @@ def run_training(cfg: dict[str, Any]) -> DSDBAModel:
   # Phase 1: head-only training.
   optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=phase1_lr)
   for epoch in range(1, min(frozen_epochs, max_epochs) + 1):
-    train_metrics = train_epoch(model, train_loader, optimizer, criterion, cfg)
+    train_metrics = train_epoch(model, train_loader, optimizer, criterion, cfg, scaler=scaler)
     val_metrics = validate_epoch(model, val_loader, cfg)
     merged = {**train_metrics, **val_metrics}
     _save_checkpoint(best_path.with_name(f"epoch_{epoch:02d}.pth"), model, epoch, merged)
@@ -320,7 +346,7 @@ def run_training(cfg: dict[str, Any]) -> DSDBAModel:
     model.unfreeze_top_n(n=2)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=min(finetune_lr, 1e-4))
     for epoch in range(frozen_epochs + 1, max_epochs + 1):
-      train_metrics = train_epoch(model, train_loader, optimizer, criterion, cfg)
+      train_metrics = train_epoch(model, train_loader, optimizer, criterion, cfg, scaler=scaler)
       val_metrics = validate_epoch(model, val_loader, cfg)
       merged = {**train_metrics, **val_metrics}
       _save_checkpoint(best_path.with_name(f"epoch_{epoch:02d}.pth"), model, epoch, merged)
