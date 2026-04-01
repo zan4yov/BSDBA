@@ -9,11 +9,11 @@
 
 | Field | Value |
 |-------|-------|
-| **Active SDLC Phase** | Phase 4 — Sprint B COMPLETE |
-| **Active Sprint** | Sprint C (entry criteria: Grad-CAM smoke-test in Colab) |
-| **Last Completed** | Sprint B — `src/cv/model.py`, `src/cv/train.py`, `src/cv/infer.py` full implementation (Chain 06) |
-| **Next Action** | Run Chain 07: Sprint C — `src/cv/gradcam.py` (FR-CV-010–016) |
-| **Gate Status** | Sprint B COMPLETE — 8/8 tests pass — FR-CV-001–009 + FR-DEP-010 all implemented |
+| **Active SDLC Phase** | Phase 4 — Sprint D COMPLETE |
+| **Active Sprint** | Sprint D (entry criteria: NLP unit tests pass, no credential patterns in source) |
+| **Last Completed** | Sprint D — `src/nlp/explain.py`, `src/tests/test_nlp.py` full implementation (Chain 08) |
+| **Next Action** | Run Chain 09: Sprint E — Deployment UI wiring (`app.py`) |
+| **Gate Status** | Sprint D COMPLETE — 8/8 tests pass — FR-NLP-001–009 implemented |
 
 ---
 
@@ -47,6 +47,8 @@
 | Phase 4 | Sprint B: `src/cv/infer.py` Full Implementation — ONNX export, equivalence verification, inference singleton | FR-CV-004, FR-DEP-010 | `src/cv/infer.py` |
 | Phase 4 | Sprint B: `src/tests/test_cv.py` — 8 tests, all passing | FR-CV-001–009, FR-DEP-010, NFR-Performance | `src/tests/test_cv.py` |
 | Phase 4 | Sprint B: `notebooks/dsdba_training.ipynb` — Cells 6–9 populated (training, ONNX, HF upload, metrics) | FR-CV-003–008, FR-DEP-010, FR-CV-007 | `notebooks/dsdba_training.ipynb` |
+| Phase 4 | Sprint D: `src/nlp/explain.py` Full Implementation — Qwen primary, Gemma fallback, rule-based fallback, prompt+cache | FR-NLP-001–009 | `src/nlp/explain.py` |
+| Phase 4 | Sprint D: `src/tests/test_nlp.py` — 8 tests, all passing (mocked API; credential pattern gate) | FR-NLP-001–009, NFR-Security | `src/tests/test_nlp.py` |
 
 ---
 

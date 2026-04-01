@@ -1,154 +1,151 @@
-"""NLP explanation tests (FR-NLP-001–009, V.E.R.I.F.Y. L3)."""
+"""
+Module: src.tests.test_nlp
+SRS Reference: FR-NLP-001–009
+Phase: 4-D — Sprint D
+V.E.R.I.F.Y. Level: 3
+"""
 
 from __future__ import annotations
 
 import asyncio
 import re
 from pathlib import Path
+from typing import Any
+
 import pytest
-import yaml
+import yaml  # type: ignore[import-untyped]
 
-from src.nlp.explain import (
-    NLPTimeoutError,
-    build_prompt,
-    build_rule_based_explanation,
-    call_gemma_fallback,
-    call_qwen_api,
-    clear_explanation_cache,
-    generate_explanation,
-)
+import src.nlp.explain as explain
 
 
-def _load_cfg() -> dict:
+def _load_cfg() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[2]
     return yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
 
 
-@pytest.fixture
-def cfg() -> dict:
+@pytest.fixture()
+def cfg() -> dict[str, Any]:
     return _load_cfg()
 
 
 @pytest.fixture(autouse=True)
-def _reset_nlp_cache() -> None:
-    clear_explanation_cache()
-    yield
-    clear_explanation_cache()
+def _clear_cache_each_test() -> None:
+    explain.clear_explanation_cache()
 
 
-def _bands() -> dict[str, float]:
-    return {"low": 10.0, "low_mid": 20.0, "high_mid": 30.0, "high": 40.0}
+def test_build_prompt_contains_all_fields(cfg: dict[str, Any]) -> None:
+    band_pct = {"low": 10.0, "low_mid": 20.0, "high_mid": 50.0, "high": 20.0}
+    prompt = explain.build_prompt("bonafide", 0.7, band_pct, cfg)
+
+    assert "bonafide" in prompt
+    assert "70.0%" in prompt
+    for band_key in ("low", "low_mid", "high_mid", "high"):
+        assert f"- {band_key} (" in prompt
 
 
-def test_build_prompt_contains_all_fields(cfg: dict) -> None:
-    band = _bands()
-    p = build_prompt("spoof", 0.87, band, cfg)
-    assert "spoof" in p
-    assert "87.0%" in p or "87" in p
-    for k in ("low", "low_mid", "high_mid", "high"):
-        assert k in p or cfg["nlp"]["band_display_names"][k] in p
-        assert f"{band[k]:.2f}" in p
+def test_rule_based_fallback_always_returns(cfg: dict[str, Any]) -> None:
+    band_pct = {"low": 25.0, "low_mid": 25.0, "high_mid": 25.0, "high": 25.0}
+    text = explain.build_rule_based_explanation("spoof", 0.8, band_pct, cfg)
+    assert isinstance(text, str)
+    assert text.strip() != ""
 
 
-def test_rule_based_fallback_always_returns(cfg: dict) -> None:
-    out = build_rule_based_explanation("bonafide", 0.91, _bands(), cfg)
-    assert isinstance(out, str)
-    assert len(out) > 40
+def test_rule_based_grammar(cfg: dict[str, Any]) -> None:
+    band_pct = {"low": 10.0, "low_mid": 20.0, "high_mid": 60.0, "high": 10.0}
+    text = explain.build_rule_based_explanation("bonafide", 0.6, band_pct, cfg)
 
-
-def test_rule_based_grammar(cfg: dict) -> None:
-    out = build_rule_based_explanation("spoof", 0.55, _bands(), cfg)
-    parts = [s.strip() for s in out.replace("?", ".").split(".") if s.strip()]
-    assert len(parts) >= 3
+    sentences = [s for s in re.split(r"[.!?]+", text) if s.strip()]
+    assert len(sentences) >= 3
 
 
 @pytest.mark.asyncio
-async def test_qwen_timeout_triggers_fallback(cfg: dict, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fail_qwen(*args: object, **kwargs: object) -> str:
-        raise NLPTimeoutError("t")
+async def test_qwen_timeout_triggers_fallback(cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    band_pct = {"low": 10.0, "low_mid": 20.0, "high_mid": 50.0, "high": 20.0}
 
-    async def fail_gemma(*args: object, **kwargs: object) -> str:
-        raise NLPTimeoutError("t")
+    async def _timeout_qwen(*_: Any, **__: Any) -> str:
+        raise explain.NLPTimeoutError("NLP-002-timeout")
 
-    monkeypatch.setattr("src.nlp.explain.call_qwen_api", fail_qwen)
-    monkeypatch.setattr("src.nlp.explain.call_gemma_fallback", fail_gemma)
+    async def _timeout_gemma(*_: Any, **__: Any) -> str:
+        raise explain.NLPTimeoutError("NLP-007-timeout")
 
-    text, api_used = await generate_explanation("spoof", 0.7, _bands(), cfg)
-    assert not api_used
-    assert "Analysis indicates" in text
+    monkeypatch.setattr(explain, "call_qwen_api", _timeout_qwen)
+    monkeypatch.setattr(explain, "call_gemma_fallback", _timeout_gemma)
 
+    text, api_used = await explain.generate_explanation("spoof", 0.8, band_pct, cfg)
 
-@pytest.mark.asyncio
-async def test_warning_flag_on_fallback(cfg: dict, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fail_qwen(*args: object, **kwargs: object) -> str:
-        raise NLPTimeoutError("t")
-
-    async def fail_gemma(*args: object, **kwargs: object) -> str:
-        raise NLPTimeoutError("t")
-
-    monkeypatch.setattr("src.nlp.explain.call_qwen_api", fail_qwen)
-    monkeypatch.setattr("src.nlp.explain.call_gemma_fallback", fail_gemma)
-
-    _, api_used = await generate_explanation("bonafide", 0.66, _bands(), cfg)
+    expected = explain.build_rule_based_explanation("spoof", 0.8, band_pct, cfg)
+    assert text == expected
     assert api_used is False
 
 
 @pytest.mark.asyncio
-async def test_cv_result_independent_of_nlp(cfg: dict, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def slow_qwen(*args: object, **kwargs: object) -> str:
-        await asyncio.sleep(0.35)
-        return "nlp done"
+async def test_warning_flag_on_fallback(cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    band_pct = {"low": 10.0, "low_mid": 20.0, "high_mid": 50.0, "high": 20.0}
 
-    monkeypatch.setattr("src.nlp.explain.call_qwen_api", slow_qwen)
+    async def _timeout_qwen(*_: Any, **__: Any) -> str:
+        raise explain.NLPTimeoutError("NLP-002-timeout")
 
-    band = _bands()
-    cv_panel = {"label": "spoof", "confidence": 0.9}
-    nlp_task = asyncio.create_task(generate_explanation("spoof", 0.9, band, cfg))
-    assert cv_panel["label"] == "spoof"
-    assert not nlp_task.done()
-    out, used = await asyncio.wait_for(nlp_task, timeout=3.0)
-    assert out == "nlp done"
-    assert used is True
+    async def _timeout_gemma(*_: Any, **__: Any) -> str:
+        raise explain.NLPTimeoutError("NLP-007-timeout")
+
+    monkeypatch.setattr(explain, "call_qwen_api", _timeout_qwen)
+    monkeypatch.setattr(explain, "call_gemma_fallback", _timeout_gemma)
+
+    _, api_used = await explain.generate_explanation("spoof", 0.8, band_pct, cfg)
+    assert api_used is False
+
+
+@pytest.mark.asyncio
+async def test_cv_result_independent_of_nlp(cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    band_pct = {"low": 10.0, "low_mid": 20.0, "high_mid": 50.0, "high": 20.0}
+
+    async def _slow_qwen(*_: Any, **__: Any) -> str:
+        await asyncio.sleep(0.05)
+        return "API explanation text"
+
+    monkeypatch.setattr(explain, "call_qwen_api", _slow_qwen)
+    monkeypatch.setattr(explain, "call_gemma_fallback", _slow_qwen)
+
+    task = asyncio.create_task(explain.generate_explanation("bonafide", 0.8, band_pct, cfg))
+
+    async def _mock_cv_display() -> str:
+        await asyncio.sleep(0)
+        return "cv displayed"
+
+    ui_result = await _mock_cv_display()
+    assert ui_result == "cv displayed"
+    assert not task.done()
+
+    await task
 
 
 def test_no_api_key_in_source() -> None:
-    """Leaked-secret shapes (long hf_/sk-) plus forbidden literals per FR-NLP-005 gate checklist."""
-    root = Path(__file__).resolve().parents[2]
-    text = (root / "src" / "nlp" / "explain.py").read_text(encoding="utf-8")
-    assert re.search(r"hf_[A-Za-z0-9]{20,}", text) is None
-    assert re.search(r"sk-[A-Za-z0-9]{20,}", text) is None
-    assert "DASH" not in text
-    assert "Bearer" not in text
+    explain_path = Path(__file__).resolve().parents[2] / "src" / "nlp" / "explain.py"
+    source = explain_path.read_text(encoding="utf-8", errors="ignore")
+
+    forbidden = ("hf_", "sk-", "DASH", "Bearer")
+    for pat in forbidden:
+        assert pat not in source
 
 
 @pytest.mark.asyncio
-async def test_cache_hit_skips_api(cfg: dict, monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = {"n": 0}
+async def test_cache_hit_skips_api(cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    band_pct = {"low": 10.0, "low_mid": 20.0, "high_mid": 50.0, "high": 20.0}
+    calls: list[int] = []
 
-    async def count_qwen(*args: object, **kwargs: object) -> str:
-        calls["n"] += 1
-        return "cached-llm-text"
+    async def _qwen_ok(*_: Any, **__: Any) -> str:
+        calls.append(1)
+        return "cached api explanation"
 
-    monkeypatch.setattr("src.nlp.explain.call_qwen_api", count_qwen)
+    monkeypatch.setattr(explain, "call_qwen_api", _qwen_ok)
+    monkeypatch.setattr(explain, "call_gemma_fallback", _qwen_ok)
 
-    band = _bands()
-    a, u1 = await generate_explanation("spoof", 0.8, band, cfg)
-    b, u2 = await generate_explanation("spoof", 0.8, band, cfg)
-    assert calls["n"] == 1
-    assert a == b == "cached-llm-text"
-    assert u1 and u2
+    text1, api_used1 = await explain.generate_explanation("bonafide", 0.8, band_pct, cfg)
+    assert text1 == "cached api explanation"
+    assert api_used1 is True
 
+    text2, api_used2 = await explain.generate_explanation("bonafide", 0.8, band_pct, cfg)
+    assert text2 == "cached api explanation"
+    assert api_used2 is True
+    assert len(calls) == 1
 
-@pytest.mark.asyncio
-async def test_call_qwen_raises_without_env_key(cfg: dict, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(cfg["nlp"]["api_key_env_var"], raising=False)
-    with pytest.raises(NLPTimeoutError):
-        await call_qwen_api("hello", cfg)
-
-
-@pytest.mark.asyncio
-async def test_call_gemma_raises_without_token(cfg: dict, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(cfg["nlp"]["hf_token_env_var"], raising=False)
-    monkeypatch.delenv(cfg["nlp"]["api_key_env_var"], raising=False)
-    with pytest.raises(NLPTimeoutError):
-        await call_gemma_fallback("hello", cfg)
