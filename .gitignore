@@ -32,6 +32,8 @@ data/processed/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
+# Training notebook is tracked in the repo — override the blanket rule above
+!notebooks/dsdba_training.ipynb
 
 # OS
 .DS_Store
